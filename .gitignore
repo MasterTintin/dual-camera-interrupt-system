@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Ignore test outputs and runtime artifacts
+captured_images/
+latency_log.csv
+*.png
+__pycache__/
