@@ -2,7 +2,8 @@ import cv2
 import time
 import os
 import threading
-\
+import csv
+
 _mock_irq_counter = 1000
 
 def get_usb_interrupt_count():
@@ -24,14 +25,13 @@ def get_usb_interrupt_count():
         return _mock_irq_counter
 
 class CameraStreamThread:
-    """ คลาสสำหรับจัดการกล้องแต่ละตัวด้วย Multi-threading เพื่อความลื่นไหลระดับ Real-time """
+    """ คลาสจัดการกล้องด้วย Multi-threading เพื่อความลื่นไหลระดับ Real-time """
     def __init__(self, src=0):
         self.capture = cv2.VideoCapture(src)
         self.ret, self.frame = self.capture.read()
         self.running = True
         self.lock = threading.Lock()
         
-        # เริ่ม Background Thread อ่านเฟรมภาพ
         self.thread = threading.Thread(target=self.update, args=(), daemon=True)
         self.thread.start()
 
@@ -52,25 +52,79 @@ class CameraStreamThread:
         self.thread.join()
         self.capture.release()
 
-print("🚀 Starting Multi-Threaded Dual-Camera & IRQ Monitor System...")
+class SnapshotSaverThread:
+    """ [ข้อ 3] แยก Thread สำหรับบันทึกภาพและคำนวณ Latency แบบไม่ให้หน้าจอหลักกระตุก """
+    def __init__(self):
+        self.queue = []
+        self.running = True
+        self.lock = threading.Lock()
+        self.thread = threading.Thread(target=self.process_queue, args=(), daemon=True)
+        self.thread.start()
 
-cam0_src = 0
-cam1_src = 0 
+    def add_task(self, frame0, frame1, irq_val, trigger_time):
+        with self.lock:
+            self.queue.append((frame0, frame1, irq_val, trigger_time))
 
-cam0 = CameraStreamThread(cam0_src)
-cam1 = CameraStreamThread(cam1_src)
+    def process_queue(self):
+        os.makedirs("captured_images", exist_ok=True)
+        csv_file = "latency_log.csv"
+        
+        # สร้างไฟล์ CSV และเขียน Header หากยังไม่มี
+        file_exists = os.path.exists(csv_file)
+        with open(csv_file, mode="a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(["Timestamp", "IRQ_Count", "Latency_ms"])
 
-print("✅ ระบบพร้อม! กด 'SPACEBAR' เพื่อ Trigger Interrupt ถ่ายภาพ / กด 'q' เพื่อออก")
+        while self.running:
+            task = None
+            with self.lock:
+                if self.queue:
+                    task = self.queue.pop(0)
+            
+            if task:
+                f0, f1, irq, start_t = task
+                ts = int(start_t)
 
-flash_timer = 0 
+                if f0 is not None:
+                    cv2.imwrite(f"captured_images/cam0_{ts}.jpg", f0)
+                if f1 is not None:
+                    cv2.imwrite(f"captured_images/cam1_{ts}.jpg", f1)
+                
+                end_t = time.time()
+                latency = (end_t - start_t) * 1000 
+                
+                # บันทึกผลลง CSV
+                with open(csv_file, mode="a", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([ts, irq, f"{latency:.2f}"])
+                
+                print(f"💾 [Background Saver] บันทึกภาพคู่สำเร็จ! Latency: {latency:.2f} ms")
+            else:
+                time.sleep(0.01)
+
+    def stop(self):
+        self.running = False
+        self.thread.join()
+
+print("🚀 Starting Advanced Multi-Threaded Dual-Camera & Analytics System...")
+
+# เปิดกล้องตัวหลักเดี่ยวๆ เพื่อป้องกันปัญหาแย่งพอร์ตบน Windows
+cam0 = CameraStreamThread(0)
+saver = SnapshotSaverThread()
+
+print("✅ ระบบพร้อม! กด 'SPACEBAR' เพื่อ Trigger Interrupt / กด 'q' เพื่อออก")
+
+flash_timer = 0
 
 while True:
     ret0, frame0 = cam0.read()
-    ret1, frame1 = cam1.read()
+    
+    # ใช้เฟรมเดียวกันจำลองเป็น Dual-stream สำหรับทดสอบบน Windows เครื่องเดียว
+    ret1, frame1 = ret0, frame0.copy() if ret0 and frame0 is not None else (False, None)
 
     current_irq = get_usb_interrupt_count()
     current_time = time.time()
-
     is_flashing = (current_time - flash_timer) < 0.3
 
     if ret0 and frame0 is not None:
@@ -78,7 +132,6 @@ while True:
             cv2.rectangle(frame0, (0, 0), (frame0.shape[1], frame0.shape[0]), (0, 0, 255), 10)
             cv2.putText(frame0, "!!! INTERRUPT FIRED !!!", (40, 90), 
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
-        
         cv2.putText(frame0, f"Cam 0 | IRQ Count: {current_irq}", (20, 40), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         cv2.imshow("Multi-Threaded Cam 0", frame0)
@@ -88,7 +141,6 @@ while True:
             cv2.rectangle(frame1, (0, 0), (frame1.shape[1], frame1.shape[0]), (0, 0, 255), 10)
             cv2.putText(frame1, "!!! INTERRUPT FIRED !!!", (40, 90), 
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
-
         cv2.putText(frame1, f"Cam 1 | IRQ Count: {current_irq}", (20, 40), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
         cv2.imshow("Multi-Threaded Cam 1", frame1)
@@ -97,23 +149,15 @@ while True:
     
     if key == ord(' '):
         start_t = time.time()
-        flash_timer = start_t  # สั่งเปิด Visual Effect แวบแดง
+        flash_timer = start_t
         print(f"\n🚨 [SINGLE INTERRUPT TRIGGERED] at {start_t}")
-        print(f"📊 USB Hardware IRQ Status: {current_irq}")
 
-        if ret0 and ret1:
-            os.makedirs("captured_images", exist_ok=True)
-            cv2.imwrite(f"captured_images/cam0_{int(start_t)}.jpg", frame0)
-            cv2.imwrite(f"captured_images/cam1_{int(start_t)}.jpg", frame1)
-            
-            end_t = time.time()
-            latency = (end_t - start_t) * 1000
-            print(f"💾 บันทึกภาพคู่สำเร็จ! Latency: {latency:.2f} ms")
+        saver.add_task(frame0, frame1, current_irq, start_t)
 
     if key == ord('q'):
         break
 
 cam0.release()
-cam1.release()
+saver.stop()
 cv2.destroyAllWindows()
 print("System shutdown gracefully.")
